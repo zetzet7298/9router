@@ -206,9 +206,22 @@ export function openaiToClaudeResponse(chunk, state) {
       if (tc.function?.arguments) {
         const toolInfo = state.toolCalls.get(idx);
         if (toolInfo) {
-          // Buffer args instead of streaming — sanitize at finish to fix bad params
-          if (!state.toolArgBuffers) state.toolArgBuffers = new Map();
-          state.toolArgBuffers.set(idx, (state.toolArgBuffers.get(idx) || "") + tc.function.arguments);
+          let toolName = toolInfo.name;
+          if (toolName.startsWith(CLAUDE_OAUTH_TOOL_PREFIX)) {
+            toolName = toolName.slice(CLAUDE_OAUTH_TOOL_PREFIX.length);
+          }
+          if (toolName === "Read") {
+            // Buffer args instead of streaming — sanitize at finish to fix bad params
+            if (!state.toolArgBuffers) state.toolArgBuffers = new Map();
+            state.toolArgBuffers.set(idx, (state.toolArgBuffers.get(idx) || "") + tc.function.arguments);
+          } else {
+            // Stream the chunks as they arrive for all other tools to prevent timeout/stalls
+            results.push({
+              type: "content_block_delta",
+              index: toolInfo.blockIndex,
+              delta: { type: "input_json_delta", partial_json: tc.function.arguments }
+            });
+          }
         }
       }
     }
