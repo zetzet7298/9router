@@ -13,7 +13,13 @@ export function openaiToOpenAIResponsesResponse(chunk, state) {
   if (!chunk) {
     return flushEvents(state);
   }
-  
+
+  // Capture usage even on usage-only chunks (choices may be empty) so it can be
+  // attached to response.completed, which is where Codex reads token counts from.
+  if (chunk.usage && typeof chunk.usage === "object") {
+    state.usage = chunk.usage;
+  }
+
   if (!chunk.choices?.length) return [];
   
   const events = [];
@@ -320,19 +326,68 @@ function closeToolCall(state, emit, idx) {
   }
 }
 
+// Convert an internal usage object (chat-completions or claude/kiro normalized shape)
+// into the Responses API usage shape that Codex's SSE parser reads:
+//   { input_tokens, output_tokens, total_tokens,
+//     input_tokens_details: { cached_tokens },
+//     output_tokens_details: { reasoning_tokens } }
+function buildResponsesUsage(stateUsage) {
+  if (!stateUsage || typeof stateUsage !== "object") return null;
+
+  const inputTokens =
+    typeof stateUsage.input_tokens === "number" ? stateUsage.input_tokens
+    : typeof stateUsage.prompt_tokens === "number" ? stateUsage.prompt_tokens
+    : 0;
+  const outputTokens =
+    typeof stateUsage.output_tokens === "number" ? stateUsage.output_tokens
+    : typeof stateUsage.completion_tokens === "number" ? stateUsage.completion_tokens
+    : 0;
+  const totalTokens =
+    typeof stateUsage.total_tokens === "number" ? stateUsage.total_tokens
+    : inputTokens + outputTokens;
+
+  const usage = {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: totalTokens
+  };
+
+  const cachedTokens =
+    stateUsage.input_tokens_details?.cached_tokens ??
+    stateUsage.prompt_tokens_details?.cached_tokens ??
+    stateUsage.cache_read_input_tokens;
+  if (typeof cachedTokens === "number" && cachedTokens > 0) {
+    usage.input_tokens_details = { cached_tokens: cachedTokens };
+  }
+
+  const reasoningTokens =
+    stateUsage.output_tokens_details?.reasoning_tokens ??
+    stateUsage.completion_tokens_details?.reasoning_tokens;
+  if (typeof reasoningTokens === "number" && reasoningTokens > 0) {
+    usage.output_tokens_details = { reasoning_tokens: reasoningTokens };
+  }
+
+  return usage;
+}
+
 function sendCompleted(state, emit) {
   if (!state.completedSent) {
     state.completedSent = true;
+    const response = {
+      id: state.responseId,
+      object: "response",
+      created_at: state.created,
+      status: "completed",
+      background: false,
+      error: null
+    };
+    const usage = buildResponsesUsage(state.usage);
+    if (usage) {
+      response.usage = usage;
+    }
     emit("response.completed", {
       type: "response.completed",
-      response: {
-        id: state.responseId,
-        object: "response",
-        created_at: state.created,
-        status: "completed",
-        background: false,
-        error: null
-      }
+      response
     });
   }
 }
