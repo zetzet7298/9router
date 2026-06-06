@@ -38,6 +38,17 @@ export class KiroExecutor extends BaseExecutor {
   async execute({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
     const url = this.buildUrl(model, stream, 0);
     const transformedBody = this.transformRequest(model, body, stream, credentials);
+
+    // Estimate input tokens from the ACTUAL request size (chars/4). Kiro's
+    // upstream usage is unreliable (often undercounts heavily or reports 0),
+    // which makes pi's context % display + auto-compaction trigger wrong. We
+    // pass this floor so the reported prompt_tokens is never below reality.
+    let estimatedInputTokens = 0;
+    try {
+      estimatedInputTokens = Math.floor(JSON.stringify(transformedBody).length / 4);
+    } catch {
+      estimatedInputTokens = 0;
+    }
     
     // Merge default retry config with provider-specific config
     const retryConfig = { ...DEFAULT_RETRY_CONFIG, ...this.config.retry };
@@ -69,7 +80,7 @@ export class KiroExecutor extends BaseExecutor {
       // Success - transform and return
       // For Kiro, we need to transform the binary EventStream to SSE
       // Create a TransformStream to convert binary to SSE text
-      const transformedResponse = this.transformEventStreamToSSE(response, model);
+      const transformedResponse = this.transformEventStreamToSSE(response, model, estimatedInputTokens);
       return { response: transformedResponse, url, headers, transformedBody };
     }
   }
@@ -78,7 +89,7 @@ export class KiroExecutor extends BaseExecutor {
    * Transform AWS EventStream binary response to SSE text stream
    * Using TransformStream instead of ReadableStream.pull() to avoid Workers timeout
    */
-  transformEventStreamToSSE(response, model) {
+  transformEventStreamToSSE(response, model, estimatedInputTokens = 0) {
     let buffer = new Uint8Array(0);
     let chunkIndex = 0;
     const responseId = `chatcmpl-${Date.now()}`;
@@ -312,7 +323,7 @@ export class KiroExecutor extends BaseExecutor {
             // Extract usage data from metricsEvent payload
             const metrics = event.payload?.metricsEvent || event.payload;
             if (metrics && typeof metrics === 'object') {
-              const inputTokens = metrics.inputTokens || 0;
+              const inputTokens = Math.max(metrics.inputTokens || 0, estimatedInputTokens);
               const outputTokens = metrics.outputTokens || 0;
               
               if (inputTokens > 0 || outputTokens > 0) {
@@ -336,16 +347,17 @@ export class KiroExecutor extends BaseExecutor {
                 ? Math.max(1, Math.floor(state.totalContentLength / 4))
                 : 0;
               
-              // Estimate input tokens from contextUsagePercentage
-              // Kiro models typically have 200k context window
-              const estimatedInputTokens = state.contextUsagePercentage > 0
+              // Estimate input tokens from contextUsagePercentage, but never
+              // below the actual request-size estimate (Kiro undercounts).
+              const pctInputTokens = state.contextUsagePercentage > 0
                 ? Math.floor(state.contextUsagePercentage * 200000 / 100)
                 : 0;
+              const estimatedInputTokensFinal = Math.max(pctInputTokens, estimatedInputTokens);
               
               state.usage = {
-                prompt_tokens: estimatedInputTokens,
+                prompt_tokens: estimatedInputTokensFinal,
                 completion_tokens: estimatedOutputTokens,
-                total_tokens: estimatedInputTokens + estimatedOutputTokens
+                total_tokens: estimatedInputTokensFinal + estimatedOutputTokens
               };
             }
             
